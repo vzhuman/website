@@ -1,0 +1,78 @@
+# Deploy Website Production — publishes the static site to GitHub Pages on
+# the custom domain constructorfabric.org whenever main is updated.
+#
+# IMPORTANT: this workflow must run ONLY on pushes to main. Pull request runs
+# are routed through Website PR CI + Publish Website Preview instead, and
+# preview artifacts must never affect the production Pages site.
+
+name: Deploy Website Production
+
+on:
+  push:
+    branches: [main]
+
+# Allow this workflow to deploy to GitHub Pages. contents:read is needed to
+# checkout; pages:write and id-token:write are required for the official
+# actions/deploy-pages action with OIDC.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Single deploy at a time; cancel stale runs on rapid pushes.
+concurrency:
+  group: website-production-deploy
+  cancel-in-progress: true
+
+# Avoid deploying an out-of-date Pages environment if a newer run supersedes.
+environment:
+  name: github-pages
+  url: https://constructorfabric.org/
+
+jobs:
+  build:
+    name: Build production site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Build site (production base path)
+        env:
+          OUTPUT_DIR: ./_site
+          # Empty PREVIEW_BASE_PATH means production build: <base> tag is
+          # NOT injected, so asset paths resolve from "/" as authored.
+          PREVIEW_BASE_PATH: ""
+        run: bash .github/scripts/build.sh
+
+      - name: Verify CNAME exists
+        run: |
+          set -euo pipefail
+          if [[ ! -f _site/CNAME ]]; then
+            echo "Error: _site/CNAME is missing. Production requires a CNAME file." >&2
+            exit 1
+          fi
+          echo "CNAME contents:"
+          cat _site/CNAME
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./_site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: https://constructorfabric.org/
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

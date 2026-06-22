@@ -1,0 +1,94 @@
+# Website PR CI — low-privilege build for preview generation.
+#
+# Runs on every pull request to build the static site with a preview base path
+# and upload the result as an artifact. This workflow MUST NOT have write
+# permissions or access secrets: artifact upload only.
+
+name: Website PR CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Strictly least-privilege: read repo contents only. No secrets, no write
+# permissions, no token write.
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same PR when a new commit is pushed; saves
+# CI minutes and surfaces the latest status quickly.
+concurrency:
+  group: website-pr-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build, lint, link check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+
+      - name: Show PR context
+        run: |
+          echo "PR number:        ${{ github.event.pull_request.number }}"
+          echo "PR base ref:      ${{ github.event.pull_request.base.ref }}"
+          echo "PR head ref:      ${{ github.event.pull_request.head.ref }}"
+          echo "PR head SHA:      ${{ github.event.pull_request.head.sha }}"
+
+      # This site has no package manager and no npm dependencies to install.
+      # If a future change introduces one (e.g. a link checker), the install
+      # step would go here and be selected based on the lockfile present.
+
+      - name: Build site with preview base path
+        env:
+          OUTPUT_DIR: ./_site
+          PREVIEW_BASE_PATH: /website-previews/pr-${{ github.event.pull_request.number }}/
+        run: bash .github/scripts/build.sh
+
+      # Lint: the site currently has no automated linter. The placeholder
+      # below is intentionally a no-op so a future addition (e.g. htmlhint)
+      # can be wired in without rewriting the workflow.
+      - name: Lint
+        run: |
+          if [[ -f package.json ]] && node -e "require('./package.json').scripts.lint" >/dev/null 2>&1; then
+            echo "Running npm run lint"
+            npm run lint
+          else
+            echo "No lint script defined — skipping"
+          fi
+
+      # Link check: optional and lightweight. Only runs if `check:links` is
+      # defined in package.json. If added, it should target OUTPUT_DIR.
+      - name: Link check
+        run: |
+          if [[ -f package.json ]] && node -e "require('./package.json').scripts['check:links']" >/dev/null 2>&1; then
+            echo "Running npm run check:links"
+            npm run check:links
+          else
+            echo "No check:links script defined — skipping"
+          fi
+
+      - name: Verify preview base path was injected
+        run: |
+          set -euo pipefail
+          # Sanity check: at least one HTML file should now contain the
+          # expected <base href> pointing at the preview subpath.
+          expected="/website-previews/pr-${{ github.event.pull_request.number }}/"
+          if ! grep -r --fixed-strings --quiet "href=\"${expected}\"" ./_site; then
+            echo "Error: expected <base href=\"${expected}\"> not found in any HTML file under ./_site" >&2
+            echo "Files in ./_site:" >&2
+            ls -la ./_site >&2
+            exit 1
+          fi
+          echo "Preview base path injection verified"
+
+      - name: Upload preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-preview-pr-${{ github.event.pull_request.number }}
+          path: ./_site
+          if-no-files-found: error
+          retention-days: 30

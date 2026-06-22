@@ -1,0 +1,108 @@
+# Cleanup old previews — runs in the website-previews repository.
+#
+# Deletes pr-* directories whose last commit is older than
+# PREVIEW_RETENTION_DAYS (default: 30). Runs daily on cron and on demand.
+
+name: Cleanup Old Previews
+
+on:
+  schedule:
+    # 03:17 UTC daily. Off-minute to avoid synchronized spikes with other
+    # workflows in the GitHub Actions fleet.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: "Override retention period in days (used for manual cleanup)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cleanup-previews
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Delete stale pr-* directories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Resolve retention days
+        id: retention
+        env:
+          VAR_VALUE: ${{ vars.PREVIEW_RETENTION_DAYS }}
+          INPUT_VALUE: ${{ inputs.retention_days }}
+        run: |
+          set -euo pipefail
+          # Priority: explicit workflow_dispatch input > repo variable > 30.
+          if [[ -n "${INPUT_VALUE}" ]]; then
+            retention_days="${INPUT_VALUE}"
+          elif [[ -n "${VAR_VALUE}" ]]; then
+            retention_days="${VAR_VALUE}"
+          else
+            retention_days="30"
+          fi
+          if ! [[ "${retention_days}" =~ ^[0-9]+$ ]]; then
+            echo "Error: retention_days must be a non-negative integer (got '${retention_days}')" >&2
+            exit 1
+          fi
+          echo "retention_days=${retention_days}" >> "$GITHUB_OUTPUT"
+          echo "Retention days: ${retention_days}"
+
+      - name: Checkout website-previews
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history to determine directory age.
+
+      - name: Configure git
+        run: |
+          git config user.name "constructorfabric-website-bot"
+          git config user.email "bot@constructorfabric.invalid"
+
+      - name: Find and delete stale pr-* directories
+        env:
+          RETENTION_DAYS: ${{ steps.retention.outputs.retention_days }}
+        run: |
+          set -euo pipefail
+          cutoff_epoch="$(date -u -d "${RETENTION_DAYS} days ago" +%s 2>/dev/null \
+                          || date -u -v -"${RETENTION_DAYS}"d +%s)"
+          echo "Cutoff time (epoch): ${cutoff_epoch}"
+          echo "Cutoff time (UTC):   $(date -u -d "@${cutoff_epoch}" 2>/dev/null \
+                                     || date -u -r "${cutoff_epoch}")"
+
+          removed_any=0
+          for dir in pr-*/; do
+            # `pr-*/` only matches directories (no files). Skip if no matches.
+            [[ -d "${dir}" ]] || continue
+            # Use the most recent commit that touched this directory.
+            last_touch_epoch="$(git log -1 --format=%ct -- "${dir}" || echo 0)"
+            if [[ -z "${last_touch_epoch}" || "${last_touch_epoch}" == "0" ]]; then
+              echo "Skip: ${dir} has no recorded commits"
+              continue
+            fi
+            if (( last_touch_epoch < cutoff_epoch )); then
+              echo "Removing ${dir} (last touched epoch ${last_touch_epoch})"
+              git rm -rf "${dir}"
+              removed_any=1
+            else
+              echo "Keep:   ${dir} (last touched epoch ${last_touch_epoch})"
+            fi
+          done
+
+          if (( removed_any == 0 )); then
+            echo "Nothing to clean up"
+          fi
+
+      - name: Commit and push deletions
+        run: |
+          set -euo pipefail
+          if git diff --cached --quiet; then
+            echo "No staged changes — nothing to commit"
+            exit 0
+          fi
+          git commit -m "Cleanup stale previews (retention: ${{ steps.retention.outputs.retention_days }} days)"
+          git push origin main
